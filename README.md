@@ -44,13 +44,21 @@ The content is built from **authoritative transcript signals**, not regex guesse
 
 ## Install
 
+Quick path:
+
+```bash
+./install.sh   # copies the hook to ~/.codex/hooks/, chmods it, prints the config block to add
+```
+
+Or manually:
+
 ```bash
 mkdir -p ~/.codex/hooks
 cp context-handover.py ~/.codex/hooks/
 chmod +x ~/.codex/hooks/context-handover.py
 ```
 
-Add to `~/.codex/config.toml`:
+Then add to `~/.codex/config.toml`:
 
 ```toml
 [hooks]
@@ -83,9 +91,27 @@ goal captured; inject-once + re-arm-on-new-compaction; nothing written into the 
 
 Separate from this hook, if Codex auto-compacts far too early (e.g. at ~17% of the window), the cause is
 usually the per-model `auto_compact_token_limit` being unset in your model catalog, so Codex falls back
-to a low default. Setting it per model (to ~75% of the usable window, **plus** the model's output reserve —
-~34k at Extra-High effort — so the *real* trigger lands at 75%) fixes it. Check effective values with
-`codex debug models`.
+to a low default. Run:
+
+```bash
+./set-auto-compact-limits.py            # sets each model to 0.75*window + reserve; --dry-run to preview
+codex debug models                      # verify the effective limits
+```
+
+This sets each model's limit to **75% of the usable window plus the output reserve** (~34k at Extra-High
+effort) so the *real* trigger lands at 75% — because Codex fires when `live_context + output_reserve >= limit`,
+not at the raw limit. See [NOTES.md](NOTES.md) for the full diagnosis of all three symptoms
+(file pileup → ~17% compaction → 66% vs 75%).
+
+## Repo contents
+
+| file | |
+|------|---|
+| `context-handover.py` | the hook (PreCompact writer + UserPromptSubmit injector) |
+| `test-context-handover.py` | 8-case regression test |
+| `install.sh` | installs the hook and prints the config block |
+| `set-auto-compact-limits.py` | sets per-model auto-compact limits for ~75% compaction |
+| `NOTES.md` | root-cause diagnosis notes |
 
 ## License
 
