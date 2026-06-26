@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# runtime output (these live outside the repo by default, but ignore if ever pointed here)
+handover-*.md
+handovers/
+state/
