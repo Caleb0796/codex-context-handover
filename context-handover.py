@@ -493,11 +493,88 @@ def first_text_field(obj):
     return ""
 
 
+TOOLS_CALL_RE = re.compile(r"tools\.(\w+)\s*\(")
+
+
+def decode_js_str(s):
+    """Unescape the common escapes in a JS double-quoted string literal."""
+    return (s.replace("\\\\", "\\").replace('\\"', '"').replace("\\n", "\n")
+             .replace("\\t", "\t").replace("\\r", "").replace("\\'", "'").replace("\\/", "/"))
+
+
+def js_field(js, key):
+    """Pull a double-quoted scalar field (key: "...") out of a JS object-literal string."""
+    m = re.search(r"\b" + re.escape(key) + r'\s*:\s*"((?:[^"\\]|\\.)*)"', js)
+    return decode_js_str(m.group(1)) if m else None
+
+
+def js_template_field(js, key):
+    """Pull a backtick template-literal field (key: `...`) — gpt-5.6 uses these for interpolated cmds."""
+    m = re.search(r"\b" + re.escape(key) + r"\s*:\s*`([^`]*)`", js)
+    return m.group(1).strip() if m else None
+
+
+def command_from_js_input(js):
+    """gpt-5.6 wraps every tool in a JS exec harness, e.g.
+       const r = await tools.exec_command({cmd: "git status", workdir: "..."}); text(r.output);
+       Return (inner_tool_label, command_text). apply_patch/update_plan return ""
+       because they are surfaced in their own sections."""
+    if not isinstance(js, str):
+        return None, ""
+    m = TOOLS_CALL_RE.search(js)
+    inner = m.group(1) if m else None
+    if inner in ("update_plan", "apply_patch"):
+        return inner, ""
+    for key in ("cmd", "command"):
+        val = js_field(js, key) or js_template_field(js, key)
+        if val:
+            return (inner or "exec"), val
+    for key in ("query", "sql", "pattern", "path", "title"):
+        val = js_field(js, key)
+        if val:
+            return inner, f"{key}: {val}"
+    # Arbitrary JS (loops, Promise.all, multiple inner calls) — a compact one-line snippet
+    # is far more useful than the bare tool name.
+    snippet = re.sub(r"\s+", " ", js).strip()
+    return (inner or "exec"), trim(snippet, 160)
+
+
+def mcp_command_from_item(item):
+    """An MCP tool call (mcp_tool_call_end): server:tool + a short argument snippet."""
+    inv = item.get("invocation")
+    if not isinstance(inv, dict):
+        return None
+    label = ":".join(x for x in (inv.get("server"), inv.get("tool")) if x) or "mcp"
+    args = inv.get("arguments")
+    snippet = ""
+    if isinstance(args, dict):
+        for key in ("cmd", "command", "query", "sql", "code", "title", "pattern"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                snippet = val
+                break
+        else:
+            snippet = json.dumps(args, sort_keys=True)
+    # `snippet` only — the render already prefixes the tool label, so don't repeat it.
+    return {"tool": label, "command": trim(snippet or label, 400),
+            "call_id": item.get("call_id")}
+
+
 def command_from_item(item):
-    if item.get("type") not in {"function_call", "tool_call"}:
+    itype = item.get("type")
+    if itype == "mcp_tool_call_end":
+        return mcp_command_from_item(item)
+    if itype not in {"function_call", "tool_call", "custom_tool_call"}:
         return None
     name = item.get("name") or item.get("tool_name") or item.get("recipient_name")
     arguments = item.get("arguments") or item.get("input") or item.get("parameters")
+    # gpt-5.6 custom_tool_call (name="exec", JS input) — or any input that wraps tools.X(...)
+    if itype == "custom_tool_call" or (isinstance(arguments, str) and "tools." in arguments):
+        inner, command = command_from_js_input(arguments)
+        if not command:
+            return None  # apply_patch/update_plan are shown elsewhere
+        return {"tool": str(inner or name or "exec"), "command": trim(command, 400),
+                "call_id": item.get("call_id")}
     command = command_from_arguments(arguments)
     if not command and isinstance(name, str):
         command = name
@@ -511,13 +588,27 @@ def output_from_item(item):
     if item.get("type") not in {"function_call_output", "custom_tool_call_output", "tool_call_output"}:
         return None
     out = item.get("output")
-    text = out if isinstance(out, str) else (first_text_field(out) if isinstance(out, dict) else "")
+    if isinstance(out, str):
+        text = out
+    elif isinstance(out, list):          # gpt-5.6 custom_tool_call_output: list of {type, text}
+        text = text_from_content(out)
+    elif isinstance(out, dict):
+        text = first_text_field(out)
+    else:
+        text = ""
     return {"call_id": item.get("call_id"), "exit_code": parse_exit_code(text), "snippet": output_snippet(text)}
 
 
 def parse_exit_code(text):
-    match = re.search(r"(?:exited with code|Exit code:)\s*(-?\d+)", text or "")
-    return int(match.group(1)) if match else None
+    t = text or ""
+    match = re.search(
+        r"(?:exited with code|Exit code:|exit code|exited with status|Process exited(?: with(?: code)?)?)\s*(-?\d+)",
+        t, re.I)
+    if match:
+        return int(match.group(1))
+    if re.search(r"\bScript failed\b", t):   # gpt-5.6 unified-exec wrapper failure marker
+        return 1
+    return None
 
 
 def output_snippet(text):
@@ -571,9 +662,12 @@ def plan_from_item(item):
     if item.get("type") not in {"function_call", "custom_tool_call", "tool_call"}:
         return None
     name = item.get("name") or item.get("tool_name") or item.get("recipient_name")
+    args = item.get("arguments") or item.get("input") or item.get("parameters")
+    # gpt-5.6: name="exec", the plan is inside a JS input string: tools.update_plan({plan: [...]})
+    if name != "update_plan" and isinstance(args, str) and "update_plan" in args:
+        return plan_from_js_input(args)
     if name != "update_plan":
         return None
-    args = item.get("arguments") or item.get("input") or item.get("parameters")
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -585,6 +679,19 @@ def plan_from_item(item):
     for step in args["plan"]:
         if isinstance(step, dict):
             steps.append({"status": str(step.get("status", "")), "step": trim(str(step.get("step", "")), 200)})
+    return steps or None
+
+
+def plan_from_js_input(js):
+    """Best-effort: pull step/status pairs out of a JS update_plan({plan:[{step,status}]}) call."""
+    steps = []
+    for block in re.findall(r"\{[^{}]*\}", js):
+        step = re.search(r"step\s*:\s*\"((?:[^\"\\]|\\.)*)\"", block)
+        if not step:
+            continue
+        status = re.search(r"status\s*:\s*\"(\w+)\"", block)
+        steps.append({"status": status.group(1) if status else "",
+                      "step": trim(decode_js_str(step.group(1)), 200)})
     return steps or None
 
 

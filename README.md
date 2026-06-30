@@ -42,6 +42,14 @@ The content is built from **authoritative transcript signals**, not regex guesse
 - **Recent commands** — with ✓ / ✗ exit markers.
 - **Key files read**, **context % at compaction**, and a compact **git** summary.
 
+### Model formats
+
+Works across model transcript formats. Older models emit `function_call` items; **gpt-5.6**
+(`sol`/`terra`/`luna`) wraps every tool in a JS exec harness as a `custom_tool_call` —
+`tools.exec_command({cmd: "…"})`, `tools.update_plan({plan:[…]})`, etc. The hook parses both,
+including backtick template-literal commands, multi-command JS scripts, list-shaped
+`custom_tool_call_output`, and `mcp_tool_call_end` MCP calls.
+
 ## Install
 
 Quick path:

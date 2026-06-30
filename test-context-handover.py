@@ -77,5 +77,33 @@ print("PASS 7: new compaction re-arms injection")
 assert not glob.glob(str(ws / "handover-*.md")), "FAIL: handover files leaked into workspace"
 print("PASS 8: no handover files written into the workspace/repo")
 
+# 9) gpt-5.6 custom_tool_call format: JS-wrapped commands, update_plan, and failures are parsed
+tx6 = tmp / "rollout56.jsonl"
+l6 = [
+    json.dumps({"item": {"type": "user_message", "message": "Refactor the auth module and add tests."}}),
+    json.dumps({"item": {"type": "custom_tool_call", "name": "exec", "call_id": "c1",
+        "input": 'const r = await tools.update_plan({plan: [{step: "Read auth module", status: "completed"}, {step: "Write tests", status: "in_progress"}]});'}}),
+    json.dumps({"item": {"type": "custom_tool_call", "name": "exec", "call_id": "c2",
+        "input": 'const r = await tools.exec_command({cmd: "git status --short", workdir: "/x"}); text(r.output);'}}),
+    json.dumps({"item": {"type": "custom_tool_call_output", "call_id": "c2",
+        "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}, {"type": "input_text", "text": " M auth.py\n"}]}}),
+    json.dumps({"item": {"type": "custom_tool_call", "name": "exec", "call_id": "c3",
+        "input": 'const r = await tools.exec_command({cmd: "pytest tests/", workdir: "/x"});'}}),
+    json.dumps({"item": {"type": "custom_tool_call_output", "call_id": "c3",
+        "output": [{"type": "input_text", "text": "Output:\nE   assert False\nProcess exited with code 1\n"}]}}),
+    json.dumps({"item": {"type": "agent_message", "message": "Tests are failing; investigating."}}),
+    json.dumps({"item": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 100}, "model_context_window": 353400, "last_token_usage": {"total_tokens": 40000}}}}),
+]
+tx6.write_text("\n".join(l6), encoding="utf-8")
+T6 = "019f1995-cccc"
+run({"cwd": str(ws), "transcript_path": str(tx6), "hook_event_name": "PreCompact", "model": "gpt-5.6-sol", "thread_id": T6})
+c6 = Path([f for f in files() if T6 in f][0]).read_text()
+assert "git status --short" in c6, "FAIL: gpt-5.6 exec cmd (double-quoted) not captured"
+assert "Write tests" in c6, "FAIL: gpt-5.6 JS-wrapped update_plan not extracted"
+assert "pytest tests/" in c6, "FAIL: gpt-5.6 failing cmd not captured"
+fail_section = c6.split("## Open failures")[1].split("\n##")[0] if "## Open failures" in c6 else ""
+assert "pytest" in fail_section, f"FAIL: failing pytest not flagged as a failure; section was:\n{fail_section}"
+print("PASS 9: gpt-5.6 custom_tool_call commands + JS update_plan + failure captured")
+
 print("\nALL TESTS PASSED")
 print("Handover files produced:", files())
