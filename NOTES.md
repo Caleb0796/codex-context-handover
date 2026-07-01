@@ -68,3 +68,41 @@ The reserve scales with reasoning effort, so at lower effort it will compact a b
 - `codex debug models` — shows the effective per-model `auto_compact_token_limit`.
 - Open a **fresh thread** (catalog changes only apply to new threads) and watch the context indicator —
   it should climb to ~75% before "Automatically compacting context."
+
+## Symptom 4: handovers written but never read (the injection gap)
+
+Even with symptoms 1–3 fixed, two days of production evidence (177 threads) showed the handover
+content going unused: of the handovers on disk, only **one** had ever actually been injected.
+
+**Why.** Injection was wired only to `UserPromptSubmit`. But ~95% of thread volume was
+automation runs (Ralph-loop style): a single long agentic turn that auto-compacts **mid-turn**
+and then ends without any further user prompt. The handover was written 59 seconds before the
+compaction — and orphaned forever. Interactive threads fared little better: by the time the user
+typed the next prompt, the pre-compaction snapshot was stale (the thread had kept working for
+hours after compacting).
+
+**What the hook API actually offers** (verified against the Codex 0.142.5 binary's embedded hook
+schemas and the `rust-v0.142.5` source):
+
+- `PreCompact`/`PostCompact` outputs have **no** `additionalContext` — writers can only observe.
+- Every compaction (local and remote) queues a **`SessionStart` hook with `source="compact"`**,
+  consumed at the next `run_turn` start. `SessionStart` **does** support `additionalContext`
+  (injected as a developer-role message). For a *pre-turn* compaction it fires in the same turn,
+  before sampling.
+- For a *mid-turn* compaction, the queued `SessionStart(compact)` won't fire until the next turn —
+  which never comes for a single-turn automation. The only true mid-turn injection point is
+  **`PreToolUse`/`PostToolUse` `additionalContext`**, recorded into history immediately.
+
+**Fix.** Three injectors sharing one per-thread dedup (handover mtime vs `injected_mtime`), so each
+compaction is injected exactly once, at the earliest boundary that exists:
+
+1. `PreToolUse` — the model's next tool call after a mid-turn compaction (~seconds later);
+2. `SessionStart(compact)` — turn boundaries, regenerated from the live transcript;
+3. `UserPromptSubmit` — interactive prompts, also regenerated so it is never stale.
+
+**Trusting the hooks headlessly.** Codex gates hooks behind `[hooks.state]` `trusted_hash`
+entries. The hash is `sha256:` over the canonical-JSON of a normalized identity
+`{event_name, matcher?, hooks:[{type, command, timeout (default 600), async, statusMessage?}]}`
+(see `command_hook_hash` + `version_for_toml` in the Codex source) — so you can precompute it and
+write it next to the hook definition instead of clicking through the trust dialog. Verify with the
+app-server: `codex app-server` → `hooks/list` shows `trustStatus` per hook.

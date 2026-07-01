@@ -22,11 +22,14 @@ else
 
 [hooks]
 PreCompact = [{ hooks = [{ type = "command", command = "$HOOK_PATH", async = false, statusMessage = "Writing context handover" }] }]
+PostCompact = [{ hooks = [{ type = "command", command = "$HOOK_PATH", async = false, statusMessage = "Refreshing context handover" }] }]
+SessionStart = [{ hooks = [{ type = "command", command = "$HOOK_PATH", async = false, statusMessage = "Checking for context handover" }] }]
+PreToolUse = [{ hooks = [{ type = "command", command = "$HOOK_PATH", async = false, timeout = 30 }] }]
 UserPromptSubmit = [{ hooks = [{ type = "command", command = "$HOOK_PATH", async = false, statusMessage = "Injecting latest context handover" }] }]
 EOF
   echo
-  echo "(If you already have a [hooks] table, merge these two keys into it.)"
+  echo "(If you already have a [hooks] table, merge these five keys into it.)"
 fi
 echo
-echo "Codex may prompt you to trust the hook the first time it fires."
+echo "Codex will prompt you to trust the hooks the first time they fire (Settings -> Hooks)."
 echo "Optional: run ./set-auto-compact-limits.py to make Codex auto-compact at ~75% (see README)."

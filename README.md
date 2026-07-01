@@ -2,15 +2,25 @@
 
 A [Codex](https://openai.com/codex/) hook that survives **auto-compaction**. When Codex
 compacts a long thread, useful working context can get summarized away. This hook writes a
-**rolling handover file** just before each compaction and **re-injects it** on your next prompt,
-so the model continues from a structured summary instead of a lossy one.
+**rolling handover file** around each compaction and **re-injects it at the earliest boundary
+Codex offers** — including *mid-turn*, on the model's next tool call — so the model continues
+from a structured summary instead of a lossy one.
 
-One script handles both ends:
+One script handles all five ends:
 
 | Event | What it does |
 |-------|--------------|
 | `PreCompact` | Writes/overwrites a per-thread handover summarizing the session state |
-| `UserPromptSubmit` | Injects that handover once per compaction as `additionalContext` |
+| `PostCompact` | Rewrites it right after compaction succeeds (covers paths where PreCompact may not fire) |
+| `PreToolUse` | **Mid-turn injector**: after an auto-compaction inside a long agentic turn, the model's next tool call injects the handover. This is the only boundary that exists for single-turn automation runs, where no follow-up prompt ever comes. Cheap no-op (~50 ms) otherwise. |
+| `SessionStart` | Codex queues a `SessionStart(source="compact")` hook after **every** compaction; this injects at the next turn start (same turn for pre-turn compactions), regenerated from the live transcript |
+| `UserPromptSubmit` | Interactive safety net — injects on your next prompt, regenerated from the live transcript so it is never stale |
+
+Exactly **one injection per compaction**: whichever event fires first consumes it (tracked per
+thread via the handover file's mtime). Why not inject from `PreCompact` itself? Codex's
+`PreCompact`/`PostCompact` hook outputs support no `additionalContext` — they can only observe
+(verified against the binary's embedded hook schemas). The three injectors above are the
+supported paths.
 
 ## Why not just use Codex's built-in compaction?
 
@@ -39,7 +49,15 @@ The content is built from **authoritative transcript signals**, not regex guesse
 - **Files changed this session** — from `patch_apply_end` (add/update/delete), not a path scrape.
 - **Open failures / blockers** — non-zero command exits paired via `call_id`, **excluding** probe
   commands (`test`/`ls`/`grep`/`rg`/`find`…) whose non-zero exit is normal control flow; plus turn-aborts and failed patches.
-- **Recent commands** — with ✓ / ✗ exit markers.
+- **Recent commands** — with ✓ / ✗ exit markers. Consecutive identical calls (agent polling like
+  `wait_agent`) collapse into one `(×N)` line — keeping the failing run's exit code if any repeat failed —
+  and encrypted inter-agent payloads (Fernet `gAAAA…` tokens) are redacted.
+- **Automation-aware goal** — scheduled/Ralph-loop runs open with framework boilerplate (lock
+  protocol, heartbeats); the goal keeps the identifying headline and drops the plumbing. Guarded
+  structurally (requires `Automation ID:`/lock markers), so a prompt merely starting with
+  "Reminder …" is rendered verbatim.
+- **Noise-filtered file lists** — locks, heartbeat logs, `logs/*.log`, and browser scratch dirs are
+  moved out of *Files changed* and the git status into a named "omitted" note.
 - **Key files read**, **context % at compaction**, and a compact **git** summary.
 
 ### Model formats
@@ -71,11 +89,17 @@ Then add to `~/.codex/config.toml`:
 ```toml
 [hooks]
 PreCompact = [{ hooks = [{ type = "command", command = "/ABSOLUTE/PATH/TO/.codex/hooks/context-handover.py", async = false, statusMessage = "Writing context handover" }] }]
+PostCompact = [{ hooks = [{ type = "command", command = "/ABSOLUTE/PATH/TO/.codex/hooks/context-handover.py", async = false, statusMessage = "Refreshing context handover" }] }]
+SessionStart = [{ hooks = [{ type = "command", command = "/ABSOLUTE/PATH/TO/.codex/hooks/context-handover.py", async = false, statusMessage = "Checking for context handover" }] }]
+PreToolUse = [{ hooks = [{ type = "command", command = "/ABSOLUTE/PATH/TO/.codex/hooks/context-handover.py", async = false, timeout = 30 }] }]
 UserPromptSubmit = [{ hooks = [{ type = "command", command = "/ABSOLUTE/PATH/TO/.codex/hooks/context-handover.py", async = false, statusMessage = "Injecting latest context handover" }] }]
 ```
 
+`PreToolUse` runs on every tool call, so it carries no `statusMessage` and a short timeout; its
+no-op path is a couple of file stats (~50 ms including interpreter startup).
+
 Use the absolute path to the script (Codex hook commands aren't shell-expanded, so `~` won't work).
-Codex may ask you to trust the hook the first time.
+Codex will ask you to trust the hooks the first time (Settings -> Hooks -> trust).
 
 ## Configuration (env vars)
 
@@ -83,6 +107,8 @@ Codex may ask you to trust the hook the first time.
 |----------|---------|---------|
 | `CODEX_HANDOVER_DIR` | `~/.codex/handovers` | Where rolling handovers are written |
 | `CODEX_HANDOVER_STATE_DIR` | `~/.codex/hooks/state` | Where per-thread injection state is stored |
+| `CODEX_HANDOVER_TAIL_BYTES` | 16 MiB | Tail window scanned for recent activity on huge rollouts |
+| `CODEX_HANDOVER_HEAD_LINES` | 30000 | Head lines scanned for the original goal / patch inventory |
 
 No external dependencies — standard-library Python 3 only.
 
@@ -92,8 +118,12 @@ No external dependencies — standard-library Python 3 only.
 python3 test-context-handover.py
 ```
 
-Covers: 5 PreCompacts on one thread → 1 file; two threads → 2 files; review subagent skipped;
-goal captured; inject-once + re-arm-on-new-compaction; nothing written into the workspace.
+29 cases: rolling-file semantics, per-thread isolation, review-subagent + subagent (`agent_id`)
+guards, goal capture (incl. automation-boilerplate trimming and its verbatim guard), inject-once +
+re-arm across all three injectors (`PreToolUse` / `SessionStart(compact)` / `UserPromptSubmit`),
+head+tail windowed scan of oversized rollouts, Fernet redaction, poll collapsing (failure-preserving),
+quoted-exit-code false positives, `[ -f x ]` probes, lock/heartbeat noise filtering, legacy-state
+migration, `PostCompact` arming, malformed env overrides, and stale-file pruning.
 
 ## Companion: compacting at ~75% instead of ~17%
 
@@ -115,8 +145,8 @@ not at the raw limit. See [NOTES.md](NOTES.md) for the full diagnosis of all thr
 
 | file | |
 |------|---|
-| `context-handover.py` | the hook (PreCompact writer + UserPromptSubmit injector) |
-| `test-context-handover.py` | 8-case regression test |
+| `context-handover.py` | the hook (PreCompact/PostCompact writers + PreToolUse/SessionStart/UserPromptSubmit injectors) |
+| `test-context-handover.py` | 29-case regression test |
 | `install.sh` | installs the hook and prints the config block |
 | `set-auto-compact-limits.py` | sets per-model auto-compact limits for ~75% compaction |
 | `NOTES.md` | root-cause diagnosis notes |

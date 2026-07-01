@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 """Codex context-handover hook.
 
-Two event paths share this one script (wired in ~/.codex/config.toml):
+Five event paths share this one script (wired in ~/.codex/config.toml):
 
   PreCompact        -> write_handover(): refresh THIS thread's rolling handover.
-  UserPromptSubmit  -> consume_latest_handover(): inject it once per compaction.
+  PostCompact       -> write_handover(): rewrite right after compaction succeeds
+                       (covers compaction paths where PreCompact may not fire).
+  PreToolUse        -> inject_handover(): the mid-turn injector. After an
+                       auto-compaction inside a long agentic turn, the model's
+                       next tool call re-arms it with the handover. This is the
+                       ONLY boundary that exists for single-turn automation runs.
+  SessionStart      -> inject_handover() when source == "compact": Codex queues a
+                       SessionStart(compact) hook after EVERY compaction; it fires
+                       at the next turn start (same turn for pre-turn compactions).
+  UserPromptSubmit  -> inject_handover(): interactive safety net; regenerates the
+                       summary from the live transcript so it is never stale.
 
-Design rules that fix the "dozens of files" failure mode:
+Design rules that fix the historical failure modes:
   * ONE rolling file per (workspace, thread) -- overwritten, never accumulated.
-    A single long turn that compacts N times => 1 file, always current.
-  * Handovers live OUTSIDE the repo (default ~/.codex/handovers/<slug>/) so they
-    never show up in `git status`. Override with CODEX_HANDOVER_DIR.
-  * State is keyed per thread, so concurrent sessions / subagents in the same
-    workspace never clobber each other's "latest" / "injected" tracking.
-  * Ephemeral review/guardian subagents (model matches SKIP_MODEL_PATTERN) never
-    write a handover -- they must not overwrite the real session's handover.
-  * The original user request is captured from the HEAD of the transcript, so
-    "Current Goal" is real even when the tail is all tool output.
+  * Handovers live OUTSIDE the repo (default ~/.codex/handovers/<slug>/).
+    Override with CODEX_HANDOVER_DIR.
+  * State is ONE FILE PER THREAD (state/threads/<id>.json), so concurrent Codex
+    windows never read-modify-write each other's injection tracking.
+  * Injection happens exactly once per compaction: the first of PreToolUse /
+    SessionStart / UserPromptSubmit to observe a handover newer than
+    injected_mtime wins; the rest see it as consumed.
+  * Ephemeral review/guardian subagents (model matches SKIP_MODEL_PATTERN) and
+    subagent turns (payload carries agent_id) neither write nor consume.
+  * The transcript scan is head+tail biased: the head yields the original goal,
+    the tail yields current state -- a 100MB rollout no longer truncates away
+    exactly the recent activity the handover exists to preserve.
 """
 import datetime as _datetime
 import hashlib
@@ -28,27 +41,69 @@ import sys
 from pathlib import Path
 
 
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 DEFAULT_STATE_DIR = Path.home() / ".codex" / "hooks" / "state"
-STATE_FILE_NAME = "context-handover-state.json"
+LEGACY_STATE_FILE_NAME = "context-handover-state.json"
 DEFAULT_HANDOVER_DIR = Path.home() / ".codex" / "handovers"
 HANDOVER_PREFIX = "handover-"
-MAX_TRANSCRIPT_LINE_SCAN = 200000   # safety cap on rollout JSONL lines scanned per handover
+# Keep both retentions EQUAL: an armed-looking handover must never outlive its
+# injection-dedup marker, or a thread resumed weeks later gets a spurious inject.
+STATE_RETENTION_DAYS = 30
+HANDOVER_RETENTION_DAYS = 30
 MAX_SNIPPET_CHARS = 1200
 MAX_HANDOVER_CHARS = 50000
 
+
+def _env_int(name, default):
+    """A malformed override env var must degrade to the default, not crash the
+    hook at import (which would fail every wired event, incl. every tool call)."""
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# Transcript scan bounds. The head scan hunts for the original goal plus rare
+# session-scoped facts (apply_patch changes, compaction history); the tail scan
+# (a byte-seek window from EOF) collects everything else, so recent state
+# survives no matter how large the rollout grows.
+HEAD_SCAN_LINES = _env_int("CODEX_HANDOVER_HEAD_LINES", 30000)
+TAIL_SCAN_BYTES = _env_int("CODEX_HANDOVER_TAIL_BYTES", 16 * 1024 * 1024)
+
 # Models used by ephemeral review/guardian subagents. They share the parent
 # thread id, so without this guard their PreCompact would overwrite the real
-# session's handover with review chatter. Never write a handover for these.
+# session's handover (and their prompts would consume its injection).
 SKIP_MODEL_PATTERN = re.compile(r"review|guardian", re.I)
+
+# Fernet tokens from inter-agent messaging (send_message/followup_task) are
+# ciphertext -- pure noise in a handover. Redacted centrally in trim().
+# Boundary lookarounds + a 40-char minimum keep interior substrings of
+# unrelated base64 payloads out of scope.
+FERNET_RE = re.compile(r"(?<![A-Za-z0-9+/=])gAAAA[A-Za-z0-9_\-]{40,}={0,2}")
+
+# Runtime/plumbing paths that mislead a resuming model when listed as session
+# work-in-progress. Deliberately narrow: locks, heartbeat logs, files inside
+# log directories, browser/session scratch. A plain *.log elsewhere may be a
+# legitimate deliverable (test fixture, parser input) and must stay visible.
+PATH_NOISE_RE = re.compile(
+    r"(\.lock$|heartbeat\.log$|(^|/)logs?/[^/]+\.log$|\.playwright-mcp(/|$)|\.tmp$)"
+)
+
+# Scheduled/automation runs open with framework boilerplate (lock protocol,
+# heartbeat rules) as the first user message; only its first line is the goal.
+# Both the prefix AND a structural marker must match, so a legitimate prompt
+# that merely starts with "Reminder ..." or "Cron ..." is never summarized.
+AUTOMATION_GOAL_RE = re.compile(r"^\s*(automation|scheduled task|cron|reminder)\b", re.I)
+AUTOMATION_MARKERS = ("automation id:", "automation memory:", "complete.flag", ".lock", "heartbeat")
 
 
 def main():
-    payload = read_payload()
-    event_name = detect_event_name(payload)
     try:
-        if event_name == "precompact":
-            handover = write_handover(payload, "PreCompact")
+        payload = read_payload()
+        event_name = detect_event_name(payload)
+        if event_name in ("precompact", "postcompact"):
+            trigger = "PreCompact" if event_name == "precompact" else "PostCompact"
+            handover = write_handover(payload, trigger)
             if handover is None:
                 emit({"continue": True, "suppressOutput": True})
             else:
@@ -61,14 +116,14 @@ def main():
                 )
             return 0
         if event_name == "userpromptsubmit":
-            additional_context = consume_latest_handover(payload)
-            output = {"continue": True, "suppressOutput": True}
-            if additional_context:
-                output["hookSpecificOutput"] = {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": additional_context,
-                }
-            emit(output)
+            return emit_injection(payload, "UserPromptSubmit")
+        if event_name == "pretooluse":
+            return emit_injection(payload, "PreToolUse")
+        if event_name == "sessionstart":
+            source = payload.get("source")
+            if source == "compact":
+                return emit_injection(payload, "SessionStart")
+            emit({"continue": True, "suppressOutput": True})
             return 0
         emit({"continue": True, "suppressOutput": True})
         return 0
@@ -83,8 +138,20 @@ def main():
         return 0
 
 
+def emit_injection(payload, event):
+    additional_context = inject_handover(payload, event)
+    output = {"continue": True, "suppressOutput": True}
+    if additional_context:
+        output["hookSpecificOutput"] = {
+            "hookEventName": event,
+            "additionalContext": additional_context,
+        }
+    emit(output)
+    return 0
+
+
 def read_payload():
-    raw = sys.stdin.read()
+    raw = sys.stdin.buffer.read().decode("utf-8", "replace")
     if not raw.strip():
         return {}
     try:
@@ -113,15 +180,19 @@ def emit(output):
     print(json.dumps(output, ensure_ascii=True))
 
 
+def is_subagent_payload(payload):
+    return bool(payload.get("agent_id") or payload.get("agentId"))
+
+
 # ---------------------------------------------------------------------------
-# Write path (PreCompact)
+# Write path (PreCompact / PostCompact)
 # ---------------------------------------------------------------------------
 
 def write_handover(payload, trigger):
     model = field(payload, "model", default=os.environ.get("CODEX_MODEL", "unknown"))
-    if SKIP_MODEL_PATTERN.search(model or ""):
-        # Ephemeral review/guardian subagent -- not resumable user work, and it
-        # must not overwrite the parent thread's handover. Skip silently.
+    if SKIP_MODEL_PATTERN.search(model or "") or is_subagent_payload(payload):
+        # Ephemeral review/guardian subagent or subagent turn -- not resumable
+        # user work, and it must not overwrite the parent thread's handover.
         return None
 
     workspace = workspace_root(payload)
@@ -136,60 +207,139 @@ def write_handover(payload, trigger):
     meta["trigger"] = trigger
 
     content = render_handover(meta=meta, transcript=transcript, git=git)
-    # Atomic overwrite so a concurrent UserPromptSubmit never reads a half file.
+    # Atomic overwrite so a concurrent injector never reads a half file.
     tmp = handover_path.with_suffix(".md.tmp")
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, handover_path)
 
-    state = load_state()
-    threads = state.setdefault("threads", {})
-    entry = threads.setdefault(thread_id, {})
+    entry = load_thread_state(thread_id)
     entry["handover_path"] = str(handover_path)
     entry["workspace"] = str(workspace)
     entry["model"] = model
     entry["written_at"] = now_iso()
-    save_state(state)
+    if transcript_path:
+        entry["transcript_path"] = str(transcript_path)
+    save_thread_state(thread_id, entry)
+    prune_stale_files()
     return handover_path
 
 
 # ---------------------------------------------------------------------------
-# Inject path (UserPromptSubmit)
+# Inject path (PreToolUse / SessionStart(compact) / UserPromptSubmit)
 # ---------------------------------------------------------------------------
 
-def consume_latest_handover(payload):
+def inject_handover(payload, event):
+    model = field(payload, "model", default=os.environ.get("CODEX_MODEL", ""))
+    if SKIP_MODEL_PATTERN.search(model or "") or is_subagent_payload(payload):
+        # Never let a review/guardian or subagent turn consume the injection
+        # meant for the real session (they share the parent thread id).
+        return ""
+
     workspace = workspace_root(payload)
     thread_id = thread_identifier(payload)
     handover_path = handover_path_for(workspace, thread_id)
+    entry = load_thread_state(thread_id)
+
     if not handover_path.exists():
+        # SessionStart(compact) means a compaction definitely just happened.
+        # If no handover file exists (compaction path that skipped the write
+        # hooks), regenerate straight from the transcript -- once per event.
+        if event == "SessionStart":
+            text = regenerate_text(payload, entry, thread_id, workspace, model, event)
+            if text:
+                entry["injected_at"] = now_iso()
+                entry["injected_event"] = event
+                try:
+                    save_thread_state(thread_id, entry)
+                except OSError:
+                    return ""
+                return injection_preamble(event, "regenerated from transcript") + text
         return ""
 
     file_mtime = handover_path.stat().st_mtime
-    state = load_state()
-    threads = state.setdefault("threads", {})
-    entry = threads.setdefault(thread_id, {})
-
     injected_mtime = entry.get("injected_mtime")
-    # Inject once per compaction: only when the file is newer than what we last
-    # injected for THIS thread. The file mtime is the source of truth, so an
-    # overwrite (new compaction) re-arms injection while a re-submit does not.
+    # Inject once per compaction: only when the file is newer than what was
+    # last injected for THIS thread. A new compaction overwrites the file and
+    # re-arms injection; anything else finds it consumed.
     if isinstance(injected_mtime, (int, float)) and file_mtime <= injected_mtime:
-        return ""
+        # Exception: SessionStart(compact) is authoritative proof a NEW
+        # compaction just happened. If the write hooks failed to refresh the
+        # file for it, it still looks consumed. Unless an injection landed
+        # recently (the normal mid-turn PreToolUse -> next-turn SessionStart
+        # sequence), regenerate and inject rather than silently lose it.
+        if event != "SessionStart" or _recent_iso(entry.get("injected_at"), minutes=30):
+            return ""
 
-    text = handover_path.read_text(encoding="utf-8", errors="replace")
+    text = ""
+    source_desc = str(handover_path)
+    if event in ("UserPromptSubmit", "SessionStart"):
+        # These can fire long after the compaction that wrote the file; the
+        # thread may have kept working. Rebuild from the live transcript so
+        # the injected state is current, falling back to the file.
+        text = regenerate_text(payload, entry, thread_id, workspace, model, event)
+        if text:
+            source_desc = "regenerated from transcript"
+    if not text:
+        text = handover_path.read_text(encoding="utf-8", errors="replace")
     if len(text) > MAX_HANDOVER_CHARS:
         text = text[:MAX_HANDOVER_CHARS] + "\n\n[Truncated by context-handover hook]\n"
 
     entry["injected_mtime"] = file_mtime
     entry["injected_at"] = now_iso()
-    save_state(state)
+    entry["injected_event"] = event
+    try:
+        save_thread_state(thread_id, entry)
+    except OSError:
+        # Fail closed and quiet: injecting without recording consumption would
+        # re-inject on every subsequent tool call (the historical runaway mode),
+        # and warning would spam the hot PreToolUse path.
+        return ""
 
+    return injection_preamble(event, source_desc) + text
+
+
+def _recent_iso(ts, minutes):
+    if not isinstance(ts, str) or not ts:
+        return False
+    try:
+        then = _datetime.datetime.fromisoformat(ts)
+    except ValueError:
+        return False
+    now = _datetime.datetime.now(then.tzinfo) if then.tzinfo else _datetime.datetime.now()
+    return (now - then).total_seconds() < minutes * 60
+
+
+def injection_preamble(event, source_desc):
+    if event == "UserPromptSubmit":
+        tail = "Continue from it, then answer the user's prompt. Do not ask the user to paste it again."
+    else:
+        tail = "Continue the in-flight work from it. Do not ask the user to repeat anything."
     return (
-        "Codex context handover injected by the UserPromptSubmit hook.\n"
-        "This summarizes THIS session's state from just before the last compaction. "
-        "Continue from it, then answer the user's prompt. Do not ask the user to paste it again.\n\n"
-        f"Source handover file: {handover_path}\n\n"
-        f"{text}"
+        f"Codex context handover injected by the {event} hook.\n"
+        "This session's context was just compacted; the summary below reconstructs "
+        f"the session state from its rollout transcript. {tail}\n\n"
+        f"Source: {source_desc}\n\n"
     )
+
+
+def regenerate_text(payload, entry, thread_id, workspace, model, event):
+    transcript_path = transcript_file(payload)
+    if transcript_path is None:
+        stored = entry.get("transcript_path")
+        if isinstance(stored, str) and stored:
+            candidate = Path(stored)
+            if candidate.is_file():
+                transcript_path = candidate
+    if transcript_path is None:
+        return ""
+    try:
+        transcript = build_summary(transcript_path)
+        git = git_summary(workspace)
+        meta = metadata(payload, workspace, transcript_path, thread_id, model)
+        meta["trigger"] = event
+        return render_handover(meta=meta, transcript=transcript, git=git)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +365,11 @@ def handover_path_for(workspace, thread_id):
 
 
 def thread_identifier(payload):
-    raw = field(payload, "thread_id", "threadId", "session_id", "sessionId", default="")
+    # session_id first: it is a REQUIRED payload field on every hook event, so
+    # all five events resolve to the same identity. thread_id is nullable and,
+    # if it appeared on only some events, would split one thread's handover and
+    # dedup state across two keys (double injection).
+    raw = field(payload, "session_id", "sessionId", "thread_id", "threadId", default="")
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw)
     return cleaned or "no-thread"
 
@@ -258,151 +412,207 @@ def unsafe_path_string(raw):
 # Transcript reading / summarization
 # ---------------------------------------------------------------------------
 
-def build_summary(transcript_path):
-    """Single full-file pass over the rollout JSONL.
+class _Collector:
+    """Accumulates transcript items; shared by the head and tail scan phases."""
 
-    Scanning the whole file (not a 256 KB tail) is what makes the goal correct:
-    the original `user_message` lives at the top of the file, while the latest
-    instruction lives near the end, and a huge agentic turn can push either out of
-    any fixed window. Rollout files are line-delimited JSON, so this stays cheap.
+    def __init__(self):
+        self.messages = []
+        self.commands = []
+        self.token_usage = []
+        self.latest_total_tokens = None
+        self.latest_current_tokens = None
+        self.latest_context_window = None
+        self.first_user = ""
+        self.last_user = ""
+        self.compaction_goal = ""   # first user text recovered from replacement_history
+        self.outputs = {}           # call_id -> {exit_code, snippet}
+        self.changed_files = {}     # path -> last change type (insertion order preserved)
+        self.patch_failures = []
+        self.read_files = []
+        self.turn_aborted = False
+        self.latest_plan = None
+
+    def process(self, item, head_phase=False):
+        message = message_from_item(item)
+        if message and message["role"] == "user" and not self.first_user:
+            self.first_user = message["text"]
+        if not self.compaction_goal:
+            goal = goal_from_compacted_item(item)
+            if goal:
+                self.compaction_goal = goal
+        changed = changed_files_from_item(item)
+        if changed:
+            for change in changed:
+                if change["success"]:
+                    self.changed_files[change["path"]] = change["type"]
+                elif not head_phase:
+                    # Old patch failures from the head window are stale, not
+                    # open blockers; only the tail contributes failures.
+                    self.patch_failures.append(change["path"])
+        if head_phase:
+            # The head window contributes only session-scoped facts: the goal,
+            # the compacted-history fallback, and the apply_patch inventory.
+            # Recency-biased sections come exclusively from the tail window.
+            return
+        if message:
+            self.messages.append(message)
+            if message["role"] == "user":
+                self.last_user = message["text"]
+        command = command_from_item(item)
+        if command:
+            command["call_ids"] = [command.get("call_id")]
+            previous = self.commands[-1] if self.commands else None
+            if (
+                previous
+                and previous["tool"] == command["tool"]
+                and previous["command"] == command["command"]
+            ):
+                # Collapse polling stretches (wait_agent, status checks) so a
+                # dozen identical calls don't evict every real command. All
+                # call_ids are kept so a failing run inside the collapsed
+                # stretch still surfaces its exit code.
+                previous["repeat"] = previous.get("repeat", 1) + 1
+                previous["call_ids"].append(command.get("call_id"))
+            else:
+                self.commands.append(command)
+            if is_read_command(command["command"]):
+                for path in paths_from_text(command["command"]):
+                    if path not in self.read_files:
+                        self.read_files.append(path)
+        out = output_from_item(item)
+        if out and out.get("call_id"):
+            self.outputs[out["call_id"]] = out
+        if item.get("type") == "turn_aborted":
+            self.turn_aborted = True
+        plan = plan_from_item(item)
+        if plan:
+            self.latest_plan = plan
+        usage = token_usage_from_item(item)
+        if usage:
+            self.token_usage.append(usage["summary"])
+            if usage["total_tokens"] is not None:
+                self.latest_total_tokens = usage["total_tokens"]
+            if usage["current_tokens"] is not None:
+                self.latest_current_tokens = usage["current_tokens"]
+            if usage["context_window"] is not None:
+                self.latest_context_window = usage["context_window"]
+
+
+def build_summary(transcript_path):
+    """Head+tail scan of the rollout JSONL.
+
+    The original user goal lives at the HEAD of the file; everything else the
+    handover needs (latest instruction, plan, commands, failures, token counts)
+    lives at the TAIL. Scanning head-first with a line cap used to throw away
+    the tail on huge rollouts -- the one part that must never go stale. Now the
+    head scan hunts only for the goal, and a byte-seek tail window collects the
+    rest, so cost stays bounded no matter how large the file grows.
     """
-    empty = {
-        "messages": [], "commands": [], "token_usage": [],
-        "latest_total_tokens": None, "latest_current_tokens": None,
-        "latest_context_window": None, "first_user": "", "last_user": "",
-        "changed_files": [], "failures": [], "read_files": [], "turn_aborted": False,
-        "plan": None,
-    }
+    collector = _Collector()
+    empty = _summary_dict(collector)
+    empty["windowed"] = False
     if not transcript_path:
         return empty
 
-    messages = []
-    commands = []
-    token_usage = []
-    latest_total_tokens = latest_current_tokens = latest_context_window = None
-    first_user = ""
-    last_user = ""
-    outputs = {}            # call_id -> {exit_code, snippet}
-    changed_files = {}      # path -> last change type (insertion order preserved)
-    patch_failures = []     # paths whose apply_patch failed
-    read_files = []         # files the agent read (recent, de-duped)
-    turn_aborted = False
-    latest_plan = None      # most recent update_plan step list
-
+    windowed = False
     try:
-        line_count = 0
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line_count += 1
-                if line_count > MAX_TRANSCRIPT_LINE_SCAN:
-                    break
-                item = parse_transcript_line(line)
-                if not item:
-                    continue
-                message = message_from_item(item)
-                if message:
-                    messages.append(message)
-                    if message["role"] == "user":
-                        if not first_user:
-                            first_user = message["text"]
-                        last_user = message["text"]
-                command = command_from_item(item)
-                if command:
-                    commands.append(command)
-                    if is_read_command(command["command"]):
-                        for path in paths_from_text(command["command"]):
-                            if path not in read_files:
-                                read_files.append(path)
-                out = output_from_item(item)
-                if out and out.get("call_id"):
-                    outputs[out["call_id"]] = out
-                changed = changed_files_from_item(item)
-                if changed:
-                    for change in changed:
-                        if change["success"]:
-                            changed_files[change["path"]] = change["type"]
-                        else:
-                            patch_failures.append(change["path"])
-                if item.get("type") == "turn_aborted":
-                    turn_aborted = True
-                plan = plan_from_item(item)
-                if plan:
-                    latest_plan = plan
-                usage = token_usage_from_item(item)
-                if usage:
-                    token_usage.append(usage["summary"])
-                    if usage["total_tokens"] is not None:
-                        latest_total_tokens = usage["total_tokens"]
-                    if usage["current_tokens"] is not None:
-                        latest_current_tokens = usage["current_tokens"]
-                    if usage["context_window"] is not None:
-                        latest_context_window = usage["context_window"]
+        size = transcript_path.stat().st_size
+        windowed = size > TAIL_SCAN_BYTES
+        # Binary mode: exact byte offsets for the tail seek, decode per line.
+        with transcript_path.open("rb") as fh:
+            if not windowed:
+                for raw in fh:
+                    item = parse_transcript_line(raw.decode("utf-8", "replace"))
+                    if item:
+                        collector.process(item)
+            else:
+                # Phase 1 (head): session-scoped facts only (goal, compaction
+                # fallback, apply_patch inventory), bounded by lines AND bytes.
+                head_bytes = 0
+                for line_count, raw in enumerate(fh, 1):
+                    head_bytes += len(raw)
+                    item = parse_transcript_line(raw.decode("utf-8", "replace"))
+                    if item:
+                        collector.process(item, head_phase=True)
+                    if line_count >= HEAD_SCAN_LINES or head_bytes >= TAIL_SCAN_BYTES // 2:
+                        break
+                # Phase 2 (tail): everything, from a byte window at EOF.
+                fh.seek(max(0, size - TAIL_SCAN_BYTES))
+                fh.readline()  # discard the partial line at the seek point
+                for raw in fh:
+                    item = parse_transcript_line(raw.decode("utf-8", "replace"))
+                    if item:
+                        collector.process(item)
     except OSError:
         return empty
 
-    # Fallback: if no clean user_message was found (e.g. heavily compacted thread),
-    # recover the original request from a compaction event's replacement_history.
-    if not first_user:
-        first_user = first_user_from_compaction(transcript_path) or ""
-        if not last_user:
-            last_user = first_user
+    # Goal fallback order: head user_message, tail user_message, then the
+    # original request recovered from a `compacted` event's replacement_history.
+    if not collector.first_user:
+        collector.first_user = collector.compaction_goal
+    if not collector.last_user:
+        collector.last_user = collector.first_user
 
-    # Attach each command's outcome (exit code + snippet) via call_id.
-    for command in commands:
-        result = outputs.get(command.get("call_id"))
-        command["exit_code"] = result.get("exit_code") if result else None
-        command["out_snippet"] = result.get("snippet") if result else ""
+    # Attach each command's outcome via call_id. For a collapsed stretch,
+    # prefer the most recent FAILING result so a fail->patch->retry cycle
+    # can't hide the failure behind the retry.
+    for command in collector.commands:
+        results = [collector.outputs[i] for i in command.get("call_ids", []) if i in collector.outputs]
+        chosen = next(
+            (r for r in reversed(results) if isinstance(r.get("exit_code"), int) and r["exit_code"] != 0),
+            results[-1] if results else None,
+        )
+        command["exit_code"] = chosen.get("exit_code") if chosen else None
+        command["out_snippet"] = chosen.get("snippet") if chosen else ""
 
+    out = _summary_dict(collector)
+    out["windowed"] = windowed
+    return out
+
+
+def _summary_dict(collector):
     # Failures: recent commands that exited non-zero, EXCLUDING probe commands
     # (test/ls/grep/find/...) whose non-zero exit is normal control flow.
     failures = [
         {"command": c["command"], "exit_code": c["exit_code"], "snippet": c.get("out_snippet", "")}
-        for c in commands
-        if isinstance(c.get("exit_code"), int) and c["exit_code"] != 0 and not is_probe_command(c["command"])
+        for c in collector.commands
+        if isinstance(c.get("exit_code"), int)
+        and c["exit_code"] != 0
+        and not is_probe_command(c["command"])
     ][-6:]
-    for path in patch_failures[-4:]:
+    for path in collector.patch_failures[-4:]:
         failures.append({"command": f"apply_patch -> {path}", "exit_code": "patch-failed", "snippet": ""})
 
-    changed = [{"path": path, "type": ctype} for path, ctype in changed_files.items()]
+    changed = [{"path": path, "type": ctype} for path, ctype in collector.changed_files.items()]
 
     return {
-        "messages": messages[-10:],
-        "commands": commands[-12:],
-        "token_usage": token_usage[-5:],
-        "latest_total_tokens": latest_total_tokens,
-        "latest_current_tokens": latest_current_tokens,
-        "latest_context_window": latest_context_window,
-        "first_user": first_user,
-        "last_user": last_user,
+        "messages": collector.messages[-10:],
+        "commands": collector.commands[-12:],
+        "token_usage": collector.token_usage[-5:],
+        "latest_total_tokens": collector.latest_total_tokens,
+        "latest_current_tokens": collector.latest_current_tokens,
+        "latest_context_window": collector.latest_context_window,
+        "first_user": collector.first_user,
+        "last_user": collector.last_user,
         "changed_files": changed[-30:],
         "failures": failures,
-        "read_files": read_files[-12:],
-        "turn_aborted": turn_aborted,
-        "plan": latest_plan,
+        "read_files": collector.read_files[-12:],
+        "turn_aborted": collector.turn_aborted,
+        "plan": collector.latest_plan,
     }
 
 
-def first_user_from_compaction(transcript_path):
+def goal_from_compacted_item(item):
     """Recover the original user request from a `compacted` event's replacement_history."""
-    try:
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if '"compacted"' not in line and '"replacement_history"' not in line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = obj.get("payload", obj)
-                history = payload.get("replacement_history") if isinstance(payload, dict) else None
-                for entry in history or []:
-                    if not isinstance(entry, dict) or entry.get("role") != "user":
-                        continue
-                    text = text_from_content(entry.get("content"))
-                    if text and not is_marker_text(text):
-                        return trim(text)
-    except OSError:
+    history = item.get("replacement_history")
+    if not isinstance(history, list):
         return ""
+    for entry in history:
+        if not isinstance(entry, dict) or entry.get("role") != "user":
+            continue
+        text = text_from_content(entry.get("content"))
+        if text and not is_marker_text(text):
+            return trim(text)
     return ""
 
 
@@ -495,11 +705,17 @@ def first_text_field(obj):
 
 TOOLS_CALL_RE = re.compile(r"tools\.(\w+)\s*\(")
 
+_JS_ESCAPES = {"n": "\n", "t": "\t", "r": "", "\\": "\\", '"': '"', "'": "'", "/": "/"}
+
 
 def decode_js_str(s):
-    """Unescape the common escapes in a JS double-quoted string literal."""
-    return (s.replace("\\\\", "\\").replace('\\"', '"').replace("\\n", "\n")
-             .replace("\\t", "\t").replace("\\r", "").replace("\\'", "'").replace("\\/", "/"))
+    """Unescape a JS double-quoted string literal in a single pass.
+
+    Sequential .replace() calls corrupt escaped backslashes ('\\\\n' would
+    decode to a newline instead of backslash-n), mangling regexes and printf
+    formats in recorded commands.
+    """
+    return re.sub(r"\\(.)", lambda m: _JS_ESCAPES.get(m.group(1), m.group(1)), s)
 
 
 def js_field(js, key):
@@ -517,14 +733,15 @@ def js_template_field(js, key):
 def command_from_js_input(js):
     """gpt-5.6 wraps every tool in a JS exec harness, e.g.
        const r = await tools.exec_command({cmd: "git status", workdir: "..."}); text(r.output);
-       Return (inner_tool_label, command_text). apply_patch/update_plan return ""
-       because they are surfaced in their own sections."""
+       Return (inner_tool_label, command_text). A call whose ONLY inner tools are
+       apply_patch/update_plan returns "" (they surface in their own sections),
+       but a compound block that ALSO runs a command still yields that command."""
     if not isinstance(js, str):
         return None, ""
-    m = TOOLS_CALL_RE.search(js)
-    inner = m.group(1) if m else None
-    if inner in ("update_plan", "apply_patch"):
-        return inner, ""
+    names = TOOLS_CALL_RE.findall(js)
+    if names and set(names) <= {"update_plan", "apply_patch"}:
+        return names[0], ""
+    inner = next((n for n in names if n not in ("update_plan", "apply_patch")), names[0] if names else None)
     for key in ("cmd", "command"):
         val = js_field(js, key) or js_template_field(js, key)
         if val:
@@ -568,8 +785,10 @@ def command_from_item(item):
         return None
     name = item.get("name") or item.get("tool_name") or item.get("recipient_name")
     arguments = item.get("arguments") or item.get("input") or item.get("parameters")
-    # gpt-5.6 custom_tool_call (name="exec", JS input) — or any input that wraps tools.X(...)
-    if itype == "custom_tool_call" or (isinstance(arguments, str) and "tools." in arguments):
+    # gpt-5.6 custom_tool_call (name="exec", JS input) — or any input that wraps
+    # tools.X(...). Requires an actual harness CALL, not just the substring
+    # "tools." (which appears in ordinary commands mentioning tools.py etc.).
+    if itype == "custom_tool_call" or (isinstance(arguments, str) and TOOLS_CALL_RE.search(arguments)):
         inner, command = command_from_js_input(arguments)
         if not command:
             return None  # apply_patch/update_plan are shown elsewhere
@@ -599,14 +818,31 @@ def output_from_item(item):
     return {"call_id": item.get("call_id"), "exit_code": parse_exit_code(text), "snippet": output_snippet(text)}
 
 
+EXIT_CODE_RE = re.compile(
+    r"^.{0,40}?(?:exited with code|Exit code:|exit code|exited with status|Process exited(?: with(?: code)?)?)\s*(-?\d+)",
+    re.I | re.M,
+)
+
+
 def parse_exit_code(text):
+    """Parse the wrapper's exit status without being fooled by command OUTPUT
+    that merely mentions exit codes (a viewed CI log, `tail deploy.log`, ...).
+
+    Only the wrapper preamble (before the `Output:` marker) and the final lines
+    of the body are considered, and matches must sit at the start of a line."""
     t = text or ""
-    match = re.search(
-        r"(?:exited with code|Exit code:|exit code|exited with status|Process exited(?: with(?: code)?)?)\s*(-?\d+)",
-        t, re.I)
-    if match:
-        return int(match.group(1))
-    if re.search(r"\bScript failed\b", t):   # gpt-5.6 unified-exec wrapper failure marker
+    marker = "\nOutput:\n"
+    if marker in t:
+        preamble, body = t.split(marker, 1)
+        tail = "\n".join(body.rstrip().splitlines()[-2:])
+        candidates = preamble + "\n" + tail
+    else:
+        candidates = t
+    matches = EXIT_CODE_RE.findall(candidates)
+    if matches:
+        return int(matches[-1])
+    head = "\n".join(candidates.splitlines()[:3])
+    if re.search(r"^\s*Script failed\b", head, re.M):   # gpt-5.6 unified-exec wrapper failure marker
         return 1
     return None
 
@@ -645,11 +881,13 @@ def is_read_command(cmd):
 
 # Commands that routinely exit non-zero as normal control flow (existence checks,
 # searches with no match). A non-zero exit here is not a blocker, so it is filtered
-# out of the failures list to avoid the false positives the old heuristic produced.
+# out of the failures list to avoid false positives. `[`/`[[` need their own
+# lookahead branch: `\b` can never match after a bracket.
 PROBE_CMD_RE = re.compile(
     r"^\s*(?:if\s+)?(?:[A-Za-z0-9_./-]*/)?"
-    r"(test|\[|\[\[|ls|grep|egrep|fgrep|rg|ag|find|stat|which|type|diff|cmp|pgrep|pidof|"
-    r"git\s+diff|git\s+grep)\b"
+    r"(?:\[\[?(?=\s)|"
+    r"(?:test|ls|grep|egrep|fgrep|rg|ag|find|stat|which|type|diff|cmp|pgrep|pidof)\b|"
+    r"git\s+(?:diff|grep)\b)"
 )
 
 
@@ -763,16 +1001,26 @@ def git_summary(workspace):
         return {"inside": False, "summary": "Not a git worktree."}
     branch = run_git(workspace, "branch", "--show-current").strip()
     head = run_git(workspace, "rev-parse", "--short", "HEAD").strip()
-    status = [
-        line
-        for line in run_git(workspace, "status", "--short").splitlines()
-        if HANDOVER_PREFIX not in line  # don't echo handover files back at ourselves
-    ]
+    status = []
+    noise = 0
+    for line in run_git(workspace, "status", "--short").splitlines():
+        if HANDOVER_PREFIX in line:  # don't echo handover files back at ourselves
+            continue
+        path_part = line.strip().split(" ", 1)[-1].strip()
+        if " -> " in path_part:  # rename: only noise if BOTH sides are noise
+            noisy = all(PATH_NOISE_RE.search(s.strip()) for s in path_part.split(" -> "))
+        else:
+            noisy = bool(PATH_NOISE_RE.search(path_part))
+        if noisy:
+            noise += 1
+            continue
+        status.append(line)
     return {
         "inside": True,
         "branch": branch or "(detached)",
         "head": head or "unknown",
         "status": status[:80],
+        "noise_omitted": noise,
     }
 
 
@@ -826,6 +1074,34 @@ def paths_from_text(text):
 # Rendering
 # ---------------------------------------------------------------------------
 
+def summarize_goal(goal):
+    """Automation/scheduled runs open with framework boilerplate (lock protocol,
+    heartbeat rules). Keep only the identifying first line so the Goal section
+    states the actual mission, not the plumbing.
+
+    Guarded structurally: the prompt must both START like an automation AND
+    contain a framework marker (Automation ID:, COMPLETE.flag, .lock, ...).
+    A real user prompt that merely begins with "Reminder ..." or "Cron ..."
+    is rendered verbatim."""
+    if not goal or not AUTOMATION_GOAL_RE.match(goal):
+        return goal
+    low = goal.lower()
+    if not any(marker in low for marker in AUTOMATION_MARKERS):
+        return goal
+    first_line = goal.splitlines()[0].strip()
+    headline = trim(first_line, 300)
+    # A collapsed single-line prompt: cut at the first protocol-ish clause.
+    if len(first_line) > 290:
+        cut = re.split(r"(?i)\b(?:FIRST|STEP 1|Acquire|Read AGENTS)\b", first_line)[0].strip(" .-:")
+        if len(cut) >= 40:
+            headline = trim(cut, 300)
+    return (
+        f"{headline}\n"
+        "_(Automation run — boilerplate preamble omitted; the automation's ledger/"
+        "memory files hold the durable protocol and state.)_"
+    )
+
+
 def render_handover(meta, transcript, git):
     goal = transcript.get("first_user") or latest_role(transcript["messages"], "user")
     latest_user = transcript.get("last_user") or ""
@@ -840,7 +1116,7 @@ def render_handover(meta, transcript, git):
         "Continue from it; do not ask the user to repeat it._",
         "",
         "## Goal (original request)",
-        goal or "Continue the active user-requested Codex task.",
+        summarize_goal(goal) or "Continue the active user-requested Codex task.",
     ]
 
     # Only show the latest instruction when it differs from the original goal.
@@ -856,10 +1132,20 @@ def render_handover(meta, transcript, git):
         lines += plan_lines(plan)
 
     lines += ["", "## Files changed this session"]
-    if changed:
-        lines += [f"- [{change['type']}] {short_path(change['path'], meta['cwd'])}" for change in changed]
+    real_changes = [c for c in changed if not PATH_NOISE_RE.search(c["path"])]
+    noise_paths = [short_path(c["path"], meta["cwd"]) for c in changed if PATH_NOISE_RE.search(c["path"])]
+    if real_changes:
+        lines += [f"- [{change['type']}] {short_path(change['path'], meta['cwd'])}" for change in real_changes]
+        if noise_paths:
+            shown = ", ".join(noise_paths[:4]) + ("…" if len(noise_paths) > 4 else "")
+            lines += [f"- _(+{len(noise_paths)} runtime/lock/log path(s) omitted: {shown})_"]
+    elif noise_paths:
+        # Name them rather than deny them — one of these may still matter.
+        lines += ["- Only runtime/lock/log paths were written: " + ", ".join(noise_paths[:6])]
     else:
         lines += ["- None recorded (no apply_patch writes in this thread)."]
+    if transcript.get("windowed"):
+        lines += ["- _(rollout exceeded the scan window; changes from the middle of the session may be missing)_"]
 
     lines += ["", "## Open failures / blockers"]
     if transcript.get("turn_aborted"):
@@ -880,8 +1166,11 @@ def render_handover(meta, transcript, git):
     lines += [f"- {context_summary(transcript)}"]
     if git["inside"]:
         status = git["status"]
-        lines += [f"- Branch {git['branch']} @ {git['head']} — "
-                  + (f"{len(status)} uncommitted path(s)" if status else "clean tree")]
+        omitted = git.get("noise_omitted", 0)
+        summary = f"{len(status)} uncommitted path(s)" if status else "clean tree"
+        if omitted:
+            summary += f" (+{omitted} lock/log path(s) omitted)"
+        lines += [f"- Branch {git['branch']} @ {git['head']} — {summary}"]
         lines += [f"  - {entry}" for entry in status[:15]]
     else:
         lines += [f"- {git['summary']}"]
@@ -967,11 +1256,13 @@ def command_lines(commands):
         code = entry.get("exit_code")
         mark = "✓" if code == 0 else ("✗" if isinstance(code, int) else "·")
         suffix = f" (exit {code})" if isinstance(code, int) and code != 0 else ""
-        out.append(f"- {mark} {entry['tool']}: {entry['command']}{suffix}")
+        repeat = f" (×{entry['repeat']})" if entry.get("repeat", 1) > 1 else ""
+        out.append(f"- {mark} {entry['tool']}: {entry['command']}{repeat}{suffix}")
     return out
 
 
 def trim(text, limit=MAX_SNIPPET_CHARS):
+    text = FERNET_RE.sub("[encrypted]", text)
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) <= limit:
         return text
@@ -979,42 +1270,73 @@ def trim(text, limit=MAX_SNIPPET_CHARS):
 
 
 # ---------------------------------------------------------------------------
-# State
+# State (one file per thread — concurrent Codex windows never share a file)
 # ---------------------------------------------------------------------------
 
 def now_iso():
     return _datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def load_state():
-    path = state_path()
-    default = {"schema_version": STATE_SCHEMA_VERSION, "threads": {}}
-    if not path.exists():
-        return default
+def state_dir():
+    raw = os.environ.get("CODEX_HANDOVER_STATE_DIR")
+    return Path(raw) if raw else DEFAULT_STATE_DIR
+
+
+def thread_state_path(thread_id):
+    return state_dir() / "threads" / f"{thread_id}.json"
+
+
+def load_thread_state(thread_id):
+    path = thread_state_path(thread_id)
+    if path.exists():
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(entry, dict):
+                return entry
+        except Exception:
+            pass
+        return {}
+    return _legacy_thread_entry(thread_id)
+
+
+def _legacy_thread_entry(thread_id):
+    """One-time migration read from the old all-threads state file."""
+    legacy = state_dir() / LEGACY_STATE_FILE_NAME
+    if not legacy.exists():
+        return {}
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(legacy.read_text(encoding="utf-8"))
+        entry = state.get("threads", {}).get(thread_id)
+        return entry if isinstance(entry, dict) else {}
     except Exception:
-        return default
-    if not isinstance(state, dict):
-        return default
-    state["schema_version"] = STATE_SCHEMA_VERSION
-    if not isinstance(state.get("threads"), dict):
-        state["threads"] = {}
-    return state
+        return {}
 
 
-def save_state(state):
-    path = state_path()
+def save_thread_state(thread_id, entry):
+    path = thread_state_path(thread_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    entry["schema_version"] = STATE_SCHEMA_VERSION
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(entry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
-def state_path():
-    raw = os.environ.get("CODEX_HANDOVER_STATE_DIR")
-    base = Path(raw) if raw else DEFAULT_STATE_DIR
-    return base / STATE_FILE_NAME
+def prune_stale_files():
+    """Drop thread-state and handover files nothing will ever read again.
+    Called from the write path only, so the hot inject paths stay cheap."""
+    now = _datetime.datetime.now().timestamp()
+    try:
+        for path in (state_dir() / "threads").glob("*.json"):
+            if now - path.stat().st_mtime > STATE_RETENTION_DAYS * 86400:
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        for path in handover_dir().glob(f"*/{HANDOVER_PREFIX}*.md"):
+            if now - path.stat().st_mtime > HANDOVER_RETENTION_DAYS * 86400:
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
